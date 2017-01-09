@@ -3,10 +3,13 @@
   * Output: Writes out a json file, and the output Dataset[UserSessionStats] in parquet format to data/ folder (appended by present timestamp in millis)
   * Dependencies: See build.sbt
   * Function: The goal of this program is to read in the gz file, and output a few descriptive statistics about the data.
-  * The session time can be toggled around, but presently it can be changed only in code, by design (admittedly poor design).
+  * The session duration (in mins) can be optionally passed in as an arg (Integer), and if nothing is passed in, assumes 15 mins.
   * Run this from within the repo using: 
   * "sbt package", followed by
-  * "/usr/local/Cellar/apache-spark/2.1.0/bin/spark-submit --class "GetUserSessionStats" --master local[4] target/scala-2.11/paytmweblogchallenge_2.11-1.0.jar"
+  * "/usr/local/Cellar/apache-spark/2.1.0/bin/spark-submit --class "GetUserSessionStats" --master local[4] target/scala-2.11/paytmweblogchallenge_2.11-1.0.jar <sessionDurInMins: Option[Int]>"
+  *
+  *
+  * Created by Sila Dey on 1/9/2017
   */
 
     import org.apache.spark.SparkContext
@@ -23,6 +26,7 @@
     import org.json4s.JsonDSL._
     import org.json4s.jackson.JsonMethods._
     import java.io._
+    import scala.util.Try
 
     object GetUserSessionStats {
 
@@ -190,6 +194,9 @@
         }
 
         def main(args: Array[String]): Unit = {
+            // TODO: Make this into arg, along with the requisite work to handle crappy inputs
+            val argSessionTimeMins : Int = if (Try(args(0).toInt).isSuccess) args(0).toInt else 15
+
             val conf = new SparkConf().setAppName("User-Session-Stats-Builder")
             val sc = new SparkContext(conf)
             val sqlc = new org.apache.spark.sql.SQLContext(sc)
@@ -220,9 +227,6 @@
                 .option("inferSchema", "true").option("delimiter", " ")
                 .schema(dfInSchema)
                 .load(inFilename)
-
-            // TODO: Make this into arg, along with the requisite work to handle crappy inputs
-            val argSessionTimeMins = 15
 
             val (dsOut, mapSessStartTimeToSessIdx) = GetUserSessionDataset(sqlc, dfIn, argSessionTimeMins)
             writeStats(dsOut, mapSessStartTimeToSessIdx, argSessionTimeMins)
