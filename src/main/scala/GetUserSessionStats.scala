@@ -1,6 +1,12 @@
 /**
-* /usr/local/Cellar/apache-spark/2.1.0/bin/spark-submit --class "GetUserSessionStats" --master local[4] target/scala-2.11/paytmweblogchallenge_2.11-1.0.jar
-*/
+  * Input: the gzipped csv file (space-separated) located in the data/ folder of the repo. The name has been hard-coded here, but can be changed to be read from config later on.
+  * Output: Writes out a json file, and the output Dataset[UserSessionStats] in parquet format to data/ folder (appended by present timestamp in millis)
+  * Dependencies: See build.sbt
+  * Function: The goal of this program is to read in the gz file, and output a few descriptive statistics about the data.
+  * Run this from within the repo using: 
+  * "sbt package", followed by
+  * "/usr/local/Cellar/apache-spark/2.1.0/bin/spark-submit --class "GetUserSessionStats" --master local[4] target/scala-2.11/paytmweblogchallenge_2.11-1.0.jar"
+  */
 
     import org.apache.spark.SparkContext
     import org.apache.spark.SparkContext._
@@ -12,12 +18,17 @@
     import org.joda.time.DateTime
     import java.sql.Timestamp
     import java.util.Calendar
+    import org.json4s._
+    import org.json4s.JsonDSL._
+    import org.json4s.jackson.JsonMethods._
+    import java.io._
 
     object GetUserSessionStats {
 
         def GetUserSessionDataset(sqlc: SQLContext, inDf: DataFrame, inSessionTimeMins: Int = 15) = {
             import sqlc.implicits._
 
+            // Reading in the 
             val dfTmp1 = inDf.where(col("elb_status")===200)
                     .select(col("ts"), col("client_port"), col("user_agt"), col("request"))
 
@@ -68,29 +79,34 @@
                 .map({ case (ip, map_sessHist) => (ip, map_sessHist, 
                     map_sessHist.map({ case (k,v) => (k, v.toSet.toSeq) })
                 )})
-                .map({ case (ip, map_sessHist, map_sessUniqueUrls) => (ip, map_sessHist, map_sessUniqueUrls, 
+                .map({ case (ip, map_sessHist, map_sessUniqueUrls) => 
+                    (ip, map_sessHist, map_sessUniqueUrls, 
                 map_sessUniqueUrls.map(_._1.toInt).toArray.sortWith(_<_) ) })
-                .map({case (ip, map_sessHist, map_sessUniqueUrls, arr_sessid) => (ip, map_sessHist, map_sessUniqueUrls, 
-                {
-                    if (arr_sessid.size > 0) {
-                        if (arr_sessid.size == 1) {
-                            Some(Array(1))
-                        } else {
-                            val outStreakArr = scala.collection.mutable.ArrayBuffer[Int](1)
-                        
-                            (0 to arr_sessid.size - 2).map({ 
-                            case idx => 
-                                if ( arr_sessid(idx) + 1 == arr_sessid(idx+1) ) {
-                                    outStreakArr(outStreakArr.size - 1) = outStreakArr.last + 1
-                                } else outStreakArr ++= Array(1)
-                            })
-                            Some(outStreakArr.toArray)
-                        }
-                    } else None 
-                }) })
-                .map({ case (ip, map_sessHist, map_sessUniqueUrls, arr_sess_hist) => (ip, map_sessHist, map_sessUniqueUrls, arr_sess_hist, 
-                arr_sess_hist.getOrElse(Array(0)).sum.toDouble/arr_sess_hist.getOrElse(Array(0)).size.toDouble,
-                arr_sess_hist.getOrElse(Array(0)).max )})
+                .map({case (ip, map_sessHist, map_sessUniqueUrls, arr_sessid) => 
+                    (ip, map_sessHist, map_sessUniqueUrls, 
+                    {
+                        if (arr_sessid.size > 0) {
+                            if (arr_sessid.size == 1) {
+                                Some(Array(1))
+                            } else {
+                                val outStreakArr = scala.collection.mutable.ArrayBuffer[Int](1)
+                            
+                                (0 to arr_sessid.size - 2).map({ 
+                                case idx => 
+                                    if ( arr_sessid(idx) + 1 == arr_sessid(idx+1) ) {
+                                        outStreakArr(outStreakArr.size - 1) = outStreakArr.last + 1
+                                    } else outStreakArr ++= Array(1)
+                                })
+                                Some(outStreakArr.toArray)
+                            }
+                        } else None 
+                    }) 
+                })
+                .map({ case (ip, map_sessHist, map_sessUniqueUrls, arr_sess_hist) => 
+                    (ip, map_sessHist, map_sessUniqueUrls, arr_sess_hist, 
+                    (arr_sess_hist.getOrElse(Array(0)).sum.toDouble * inSessionTimeMins)/arr_sess_hist.getOrElse(Array(0)).size.toDouble,
+                    (arr_sess_hist.getOrElse(Array(0)).max * inSessionTimeMins) )
+                })
                 .withColumnRenamed("_1", "client")
                 .withColumnRenamed("_2", "sessHistory")
                 .withColumnRenamed("_3", "sessUniqueUrls")
@@ -103,6 +119,36 @@
 
         }
 
+        def writeStats(inDs: Dataset[UserSessionStats], mapSessStartTimeToSessIdx: Map[Long, Int],  inSessionTimeMins: Int = 15) = {
+            val maxSessDur : Int = inDs.agg(max(col("sessMaxDur"))).take(1)(0).getInt(0)
+            val avgSessDur : Double = inDs.agg(avg(col("sessAvgDur"))).take(1)(0).getDouble(0)
+
+            val listEngagedUsers = inDs
+                                .where(col("sessMaxDur")===maxSessDur)
+                                .select(col("client"))
+                                .collect
+                                .map(_.toString)
+
+            implicit val formats = DefaultFormats
+
+            val outJson = compact(render(
+                ("chosenSessionTime" -> inSessionTimeMins)
+                ~ ("numUsers" -> inDs.count)
+                ~ ("maxSessDur" -> maxSessDur) 
+                ~ ("avgSessDur" -> avgSessDur)
+                ~ ("listEngagedUsers" -> Extraction.decompose(listEngagedUsers))
+                ~ ("mapSessStartTimeToSessIdx", Extraction.decompose(mapSessStartTimeToSessIdx))
+                ))
+
+            val outTs = System.currentTimeMillis
+            inDs.write.parquet("data/userStatsDataset_"+outTs)
+            new PrintWriter(new File("data/userStatsJson_"+outTs+".json")) {
+                write(outJson)
+                close
+            }
+            println(s"outJson: ${pretty(render(outJson))}")
+        }
+
         def main(args: Array[String]): Unit = {
             val conf = new SparkConf().setAppName("User-Session-Stats-Builder")
             val sc = new SparkContext(conf)
@@ -111,6 +157,8 @@
 
             val inFilename : String = "data/2015_07_22_mktplace_shop_web_log_sample.log.gz"
 
+            // Explicit schema definition of input file
+            // Reference: http://docs.aws.amazon.com/ElasticLoadBalancing/latest/DeveloperGuide/access-log-collection.html#access-log-entry-format
             val dfInSchema = new StructType()
                 .add("ts", TimestampType)
                 .add("elb_name", StringType)
@@ -133,12 +181,11 @@
                 .schema(dfInSchema)
                 .load(inFilename)
 
+            // TODO: Make this into arg, along with the requisite work to handle crappy inputs
             val argSessionTimeMins = 15
 
             val (dsOut, mapSessStartTimeToSessIdx) = GetUserSessionDataset(sqlc, dfIn, argSessionTimeMins)
-            println(s"***** Number of users: ${dsOut.count} *****")
-            val outFilename = "/data/UserSessionStats_"+System.currentTimeMillis()+".csv"
-            dsOut.write.format("com.databricks.spark.csv").save(outFilename)
+            writeStats(dsOut, mapSessStartTimeToSessIdx, argSessionTimeMins)
         }
         
         case class UserSessionStats( 
