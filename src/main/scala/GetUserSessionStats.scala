@@ -3,6 +3,7 @@
   * Output: Writes out a json file, and the output Dataset[UserSessionStats] in parquet format to data/ folder (appended by present timestamp in millis)
   * Dependencies: See build.sbt
   * Function: The goal of this program is to read in the gz file, and output a few descriptive statistics about the data.
+  * The session time can be toggled around, but presently it can be changed only in code, by design (admittedly poor design).
   * Run this from within the repo using: 
   * "sbt package", followed by
   * "/usr/local/Cellar/apache-spark/2.1.0/bin/spark-submit --class "GetUserSessionStats" --master local[4] target/scala-2.11/paytmweblogchallenge_2.11-1.0.jar"
@@ -25,10 +26,25 @@
 
     object GetUserSessionStats {
 
-        def GetUserSessionDataset(sqlc: SQLContext, inDf: DataFrame, inSessionTimeMins: Int = 15) = {
+        def GetUserSessionDataset(
+            sqlc: SQLContext
+            , inDf: DataFrame
+            , inSessionTimeMins: Int = 15
+            ) = {
+            /** Input: Raw Dataframe, and input session time in minutes (default of 15 mins)
+              * Output: The per-user dataset of descriptive statistics, Dataset[UserSessionStats]
+              * , and the Mapping of session start time in millis to sessionIdx
+              * Function: This function does pre-processing on a few columns (ts, request, client_port)
+              * , converts it into per-user Dataset, and calculates the per-user statistics of session duration
+              * (max, as well as average). 
+              * The transformation to timestamp is the one that needs little explanation. 
+              * First, the timestamp is converted to millis, and then session indices are created in 
+              * intervals of (inSessionTimeMins, default 15 mins), and these session indices are used throughout.
+              * However, as mentioned above, one of the outputs is also the mapping of the session start times to their index
+              * 
+              */
             import sqlc.implicits._
 
-            // Reading in the 
             val dfTmp1 = inDf.where(col("elb_status")===200)
                     .select(col("ts"), col("client_port"), col("user_agt"), col("request"))
 
@@ -38,7 +54,8 @@
             val tsMax_tmp = new DateTime(dfTmp1.select(max(col("ts"))).take(1)(0).getAs[java.sql.Timestamp](0))
             val tsMax = new DateTime(tsMax_tmp.getYear, tsMax_tmp.getMonthOfYear, tsMax_tmp.getDayOfMonth, tsMax_tmp.getHourOfDay, tsMax_tmp.getMinuteOfHour)
 
-            val mapSessStartToSessId = (tsMin.getMillis to tsMax.getMillis by inSessionTimeMins*60*1000).zipWithIndex.toMap
+            // Create map of session start time to session index
+            val mapSessStartToSessIdx = (tsMin.getMillis to tsMax.getMillis by inSessionTimeMins*60*1000).zipWithIndex.toMap
 
             val convertTimestampToMillisUDF = udf( (inTs: Timestamp) => {
                 val cal = Calendar.getInstance()
@@ -46,12 +63,15 @@
                 cal.getTimeInMillis
             })
 
+            // UDF to retain only the relevant portion of URL upto "?"
             val cropRequestToUrlUDF = udf( (inStr: String) => {
                 if (inStr.length > 0) Some(inStr.split(" ")(1).split("\\?")(0)) else None
             } )
 
+            // UDF to retain only IP, and drop specific PORT info
             val getClientUrlFromClientPortUDF = udf( (inPort: String) => (inPort.split(":")(0)) )
 
+            // UDF to convert the ts in millis to session index
             val convertMillisToSessIdxUDF = udf( (inMillis: Long ) => (inMillis - tsMin.getMillis)/(inSessionTimeMins*60*1000L) )
 
             val dfTmp2 = dfTmp1
@@ -64,6 +84,7 @@
                 .drop("client_port")
                 .withColumn("sess_id", convertMillisToSessIdxUDF(col("tsMillis")))
 
+            // Transform evented data to per-user format by grouping-by IP (or client)
             val dsTmp1 = dfTmp2.rdd.map(r => 
                 (r.getString(2), Tuple2(r.getLong(3),r.getString(1)) ) 
                 ).toDS
@@ -73,6 +94,13 @@
                 .withColumnRenamed("collect_list(_2)", "sessId_req")
                 .as[(String, Seq[(Long, String)])]
 
+            // Transform the per-user dataset for each of the below statistics
+            // 1. session history
+            // 2. session unique visited urls
+            // 3. session streak history
+            // 4. session average duration
+            // 5. session max duration
+            // case class UserSessionStats describes the expected schema as well
             val dsFinal = dsTmp1.map({ case (ip, seq_sessid_url) => (ip, 
                     seq_sessid_url.groupBy(_._1).map({ case x => (x._1, x._2.map(_._2))})) 
                 })
@@ -115,19 +143,31 @@
                 .withColumnRenamed("_6", "sessMaxDur")
                 .as[UserSessionStats]
 
-            (dsFinal, mapSessStartToSessId)
-
+            (dsFinal, mapSessStartToSessIdx)
         }
 
-        def writeStats(inDs: Dataset[UserSessionStats], mapSessStartTimeToSessIdx: Map[Long, Int],  inSessionTimeMins: Int = 15) = {
+        def writeStats(
+            inDs: Dataset[UserSessionStats]
+            , mapSessStartTimeToSessIdx: Map[Long, Int]
+            ,  inSessionTimeMins: Int = 15
+            ) = {
+            /**
+              * Input: the final dataset with requisite schema, Dataset[UserSessionStats]
+              * , and the session duration chosen
+              * Output: Unit
+              * Function: This function writes out the stats to the data/ in the repo,
+              * specifically : 1. JSON file with requisite info, 2. parquet output Dataset[UserSessionStats]
+              * The function also prints the JSON file to console
+              */
             val maxSessDur : Int = inDs.agg(max(col("sessMaxDur"))).take(1)(0).getInt(0)
             val avgSessDur : Double = inDs.agg(avg(col("sessAvgDur"))).take(1)(0).getDouble(0)
 
+            // Filter all users who have the maximum session duration of all users (happens to be only 1)
             val listEngagedUsers = inDs
-                                .where(col("sessMaxDur")===maxSessDur)
-                                .select(col("client"))
-                                .collect
-                                .map(_.toString)
+                .where(col("sessMaxDur")===maxSessDur)
+                .select(col("client"))
+                .collect
+                .map(_.toString)
 
             implicit val formats = DefaultFormats
 
